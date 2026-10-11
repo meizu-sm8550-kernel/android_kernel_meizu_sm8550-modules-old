@@ -5,8 +5,10 @@
 #include <linux/workqueue.h>
 #include <linux/of.h>
 #include "dsi_display.h"
+#include "dsi_drm.h"
 #include "dsi_panel.h"
 #include "dsi_clk.h"
+#include "sde_encoder.h"
 #include "dsi_m2468_hbm.h"
 
 int dsi_m2468_hbm_set_lut(struct dsi_panel *panel, const void *data, size_t size)
@@ -57,6 +59,32 @@ static void m2468_ready_work_fn(struct work_struct *work)
 }
 static DECLARE_WORK(m2468_ready_work, m2468_ready_work_fn);
 
+/* The panel refreshes from its own memory, so the local-HBM tables are in
+ * effect within one panel frame of the completed transaction whether or not
+ * SDE delivers a TE interrupt. If no TE was counted within a few frames of
+ * arming, publish ready from here; a counted TE or any clear cancels this.
+ */
+static void m2468_ready_fallback_fn(struct work_struct *work)
+{
+	unsigned long flags;
+	bool publish = false;
+
+	spin_lock_irqsave(&m2468_ready_lock, flags);
+	if (m2468_display && m2468_armed && m2468_remaining &&
+	    !atomic_read(&m2468_display->panel->esd_recovery_pending)) {
+		m2468_remaining = 0;
+		m2468_ready = true;
+		m2468_armed = false;
+		publish = true;
+	}
+	spin_unlock_irqrestore(&m2468_ready_lock, flags);
+	if (publish) {
+		DSI_WARN("M2468 local HBM ready published without a counted TE\n");
+		schedule_work(&m2468_ready_work);
+	}
+}
+static DECLARE_DELAYED_WORK(m2468_ready_fallback, m2468_ready_fallback_fn);
+
 static void m2468_clear_ready(struct dsi_panel *panel)
 {
 	unsigned long flags;
@@ -66,6 +94,7 @@ static void m2468_clear_ready(struct dsi_panel *panel)
 		m2468_ready_generation++;
 		m2468_armed = false;
 		m2468_ready = false;
+		cancel_delayed_work(&m2468_ready_fallback);
 		schedule_work(&m2468_ready_work);
 	}
 	spin_unlock_irqrestore(&m2468_ready_lock, flags);
@@ -74,15 +103,38 @@ static void m2468_clear_ready(struct dsi_panel *panel)
 static void m2468_arm_ready(struct dsi_panel *panel)
 {
 	unsigned long flags;
+	u32 hz = panel->cur_mode ? panel->cur_mode->timing.refresh_rate : 0;
+	u32 fallback_ms = hz ? DIV_ROUND_UP(3000, hz) : 50;
 
+	if (fallback_ms < 20)
+		fallback_ms = 20;
 	spin_lock_irqsave(&m2468_ready_lock, flags);
 	if (m2468_display && m2468_display->panel == panel) {
 		m2468_ready_generation = panel->m2468_hbm.state.generation;
 		m2468_remaining = panel->m2468_hbm.vblanks;
 		m2468_armed = true;
 		m2468_ready = false;
+		mod_delayed_work(system_wq, &m2468_ready_fallback,
+				 msecs_to_jiffies(fallback_ms));
 	}
 	spin_unlock_irqrestore(&m2468_ready_lock, flags);
+}
+
+/* display_lock held, panel_lock released. SDE idle power collapse disables
+ * the master RD_PTR interrupt within tens of milliseconds of the last frame,
+ * so a static frame can arm ready and never count a TE. Waking the encoder
+ * resumes TE counting; its own idle timer re-enters power collapse later.
+ * Failure only leaves ready to the bounded fallback above.
+ */
+static void m2468_kick_te(struct dsi_display *display)
+{
+	int rc;
+
+	if (!display->bridge || !display->bridge->base.encoder)
+		return;
+	rc = sde_encoder_m2468_early_wakeup(display->bridge->base.encoder);
+	if (rc)
+		DSI_WARN("M2468 local HBM TE wakeup failed: %d\n", rc);
 }
 
 void dsi_m2468_hbm_te(void *display)
@@ -346,7 +398,7 @@ static int m2468_transaction(struct dsi_display *display, bool on, bool adfr, u3
 	struct dsi_panel *p = display->panel;
 	struct m2468_hbm_state *s = &p->m2468_hbm.state;
 	int rc, unvote;
-	bool newly_on = false, use_adfr;
+	bool newly_on = false, use_adfr, kick = false;
 
 	if (!p->m2468_hbm.supported || display->trusted_vm_env || !display->hw_ownership)
 		return -EOPNOTSUPP;
@@ -409,9 +461,13 @@ out:
 		if (!rc)
 			rc = unvote;
 	}
-	if (!rc && newly_on && s->phase == M2468_HBM_ON && !p->m2468_hbm.low_power)
+	if (!rc && newly_on && s->phase == M2468_HBM_ON && !p->m2468_hbm.low_power) {
 		m2468_arm_ready(p);
+		kick = true;
+	}
 	mutex_unlock(&p->panel_lock);
+	if (kick)
+		m2468_kick_te(display);
 	return rc;
 }
 
@@ -559,6 +615,7 @@ void dsi_m2468_hbm_unbind(struct dsi_display *display)
 	mutex_unlock(&display->display_lock);
 	mutex_unlock(&m2468_entry_lock);
 	/* IRQ cannot queue after the pointer is cleared under its own lock. */
+	cancel_delayed_work_sync(&m2468_ready_fallback);
 	cancel_work_sync(&m2468_ready_work);
 	kobject_put(kobj);
 out:

@@ -67,6 +67,22 @@ low power keeps the existing brightness-only behavior and does not establish
 valid compensation. HBM OFF idempotence, fixed 144/90 Hz ADFR separation, dynamic
 LOCAL_OFF demura and the framework-ready handshake remain intact.
 
+Local HBM FAULT is recoverable. A pass that leaves unknown partial state marks
+FAULT, and the next request runs the complete restore sequence instead of
+refusing until a panel reset: OFF returns to the known OFF baseline when every
+stage succeeds, ON restores first and then enables. A restore that fails again
+keeps FAULT and reports the first error. If no successful ordinary brightness
+transaction has been recorded since the last invalidation, ON first runs one to
+establish the level and demura inputs rather than answering -EAGAIN.
+
+The framework-ready handshake counts the master RD_PTR interrupt, which SDE
+idle power collapse disables shortly after the last frame. After a successful
+ON the driver synchronously requests the SDE early-wakeup event so a TE is
+counted on a static frame. If no TE is counted within three frames (at least
+20 ms) of arming, ready is published by a bounded fallback with a warning; the
+panel refreshes from its own memory, so the tables are already in effect. A
+counted TE, any clear or unbind cancels the fallback.
+
 Verification boundary
 ---------------------
 

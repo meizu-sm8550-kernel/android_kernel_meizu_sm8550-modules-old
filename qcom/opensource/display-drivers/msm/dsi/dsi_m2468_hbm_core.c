@@ -80,7 +80,11 @@ static void m2468_first_error(int *first, int rc)
 		*first = rc;
 }
 
-/* Always attempt all recovery stages; partial packets may have taken effect. */
+/* Always attempt all recovery stages; partial packets may have taken effect.
+ * Without a trusted attempted level (FAULT after invalidation) the level
+ * table is cleared unconditionally; its OFF payload is the same for every
+ * brightness and the full backlight restore rebuilds compensation after it.
+ */
 static int m2468_hbm_restore(struct m2468_hbm_state *s, u32 after, bool use_adfr,
 		const struct m2468_hbm_ops *ops, void *ctx)
 {
@@ -88,7 +92,7 @@ static int m2468_hbm_restore(struct m2468_hbm_state *s, u32 after, bool use_adfr
 
 	s->phase = M2468_HBM_DISABLING;
 	m2468_first_error(&first, ops->send(ctx, M2468_LOCAL_OFF, 0));
-	if (s->attempted >= 3151)
+	if (!s->attempted_valid || s->attempted >= 3151)
 		m2468_first_error(&first, ops->send(ctx, M2468_LEVEL_OFF, 0));
 	ops->wait_ms(ctx, after);
 	m2468_first_error(&first, ops->restore(ctx));
@@ -116,17 +120,33 @@ int m2468_hbm_run(struct m2468_hbm_state *s, bool on, u32 hz, bool use_adfr,
 	rc = m2468_hbm_delays(hz, &before, &after);
 	if (rc)
 		return rc;
-	if (s->phase == M2468_HBM_FAULT)
-		return -EIO;
 	if ((on && s->phase == M2468_HBM_ON) || (!on && s->phase == M2468_HBM_OFF))
 		return 0;
-	if (!s->attempted_valid || !s->successful_valid)
-		return -EAGAIN;
 	if (s->attempted > 4095 || s->requested > 4095)
 		return -ERANGE;
 	s->generation++;
-	if (!on)
-		return m2468_hbm_restore(s, after, use_adfr, ops, ctx);
+	if (!on || s->phase == M2468_HBM_FAULT) {
+		/* FAULT records an earlier pass that left unknown partial state.
+		 * The restore sequence is its recovery: a complete pass
+		 * re-establishes the known OFF baseline, a failed pass keeps
+		 * FAULT and reports it. Refusing until a full panel reset would
+		 * stall every later request until the next screen-off cycle.
+		 */
+		rc = m2468_hbm_restore(s, after, use_adfr, ops, ctx);
+		if (rc || !on)
+			return rc;
+	}
+	if (!s->attempted_valid || !s->successful_valid) {
+		/* The level table and demura payload need a known backlight.
+		 * Establish it with the ordinary setter pass; a failed or
+		 * suppressed setter still leaves this request unanswered.
+		 */
+		rc = ops->restore(ctx);
+		if (rc)
+			return rc;
+		if (!s->attempted_valid || !s->successful_valid)
+			return -EAGAIN;
+	}
 
 	/* Candidate default policy is ADFR off until explicitly programmed. */
 	s->saved_adfr = use_adfr && s->adfr_valid ? s->adfr : 0;

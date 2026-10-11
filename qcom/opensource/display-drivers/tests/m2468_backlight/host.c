@@ -393,6 +393,47 @@ int main(void) {
   if(!fail)CHECK(p.m2468_hbm.state.saved_adfr==0 && p.m2468_hbm.state.successful_valid);
   p.panel_lock=0;clock_depth=0;
  }
+ /* A faulted state is recovered by the next request instead of refusing until a panel reset:
+  * OFF runs the restore pass, ON runs it and then enables; a restore that fails again stays FAULT. */
+ for(int fixed=0;fixed<2;fixed++) for(int want_on=0;want_on<2;want_on++) {
+  u32 hz=fixed ? 144 : 120;
+  fresh(&p);mode.timing.refresh_rate=hz;p.bl_config.bl_level=3300;p.m2468_hbm.state.requested=3300;
+  CHECK(!set(&p,3300));p.m2468_hbm.state.adfr=32;p.m2468_hbm.state.adfr_valid=true;
+  reset_trace();clock_depth=1;p.panel_lock=1;
+  CHECK(!m2468_hbm_run(&p.m2468_hbm.state,true,hz,!fixed,&coupled_ops,&p) && p.m2468_hbm.state.phase==M2468_HBM_ON);
+  reset_trace();clock_depth=1;fail_packet=54;
+  CHECK(m2468_hbm_run(&p.m2468_hbm.state,false,hz,!fixed,&coupled_ops,&p)==-EIO && p.m2468_hbm.state.phase==M2468_HBM_FAULT);
+  CHECK(!p.m2468_hbm.state.successful_valid);
+  reset_trace();clock_depth=1;fail_packet=1;
+  CHECK(m2468_hbm_run(&p.m2468_hbm.state,want_on,hz,!fixed,&coupled_ops,&p)==-EIO && p.m2468_hbm.state.phase==M2468_HBM_FAULT);
+  reset_trace();clock_depth=1;
+  CHECK(!m2468_hbm_run(&p.m2468_hbm.state,want_on,hz,!fixed,&coupled_ops,&p));
+  CHECK(p.m2468_hbm.state.phase==(want_on ? M2468_HBM_ON : M2468_HBM_OFF));
+  CHECK(p.m2468_hbm.state.successful_valid && p.m2468_hbm.state.attempted_valid && sent>=104);
+  CHECK(p.m2468_bl.state.valid==!want_on && !ctrl.owned && !ctrl.cmd_len && clock_depth==1);
+  if(want_on) { reset_trace();clock_depth=1;CHECK(!m2468_hbm_run(&p.m2468_hbm.state,false,hz,!fixed,&coupled_ops,&p) && p.m2468_hbm.state.phase==M2468_HBM_OFF); }
+  p.panel_lock=0;clock_depth=0;
+ }
+ /* An unknown backlight (failed or suppressed setter since the last reset) is re-established by the
+  * ordinary setter before enabling, instead of answering -EAGAIN; a failing setter still reports. */
+ for(int fail=0;fail<2;fail++) {
+  fresh(&p);mode.timing.refresh_rate=144;p.bl_config.bl_level=2000;p.m2468_hbm.state.requested=2000;
+  CHECK(!set(&p,2000));p.m2468_hbm.state.successful_valid=false;
+  reset_trace();clock_depth=1;p.panel_lock=1;if(fail)fail_packet=1;
+  CHECK(m2468_hbm_run(&p.m2468_hbm.state,true,144,false,&coupled_ops,&p)==(fail ? -EIO : 0));
+  CHECK(p.m2468_hbm.state.phase==(fail ? M2468_HBM_OFF : M2468_HBM_ON));
+  CHECK(p.m2468_hbm.state.successful_valid==!fail && sent==(fail ? 1 : 1+54));
+  p.panel_lock=0;clock_depth=0;
+ }
+ /* The invalidated attempted level must not skip the level table during a FAULT restore. */
+ fresh(&p);mode.timing.refresh_rate=144;p.bl_config.bl_level=3300;p.m2468_hbm.state.requested=3300;
+ CHECK(!set(&p,3300));reset_trace();clock_depth=1;p.panel_lock=1;
+ CHECK(!m2468_hbm_run(&p.m2468_hbm.state,true,144,false,&coupled_ops,&p));
+ dsi_m2468_hbm_invalidate(&p,false);CHECK(p.m2468_hbm.state.phase==M2468_HBM_FAULT && !p.m2468_hbm.state.attempted_valid);
+ reset_trace();clock_depth=1;
+ CHECK(!m2468_hbm_run(&p.m2468_hbm.state,false,144,false,&coupled_ops,&p) && p.m2468_hbm.state.phase==M2468_HBM_OFF && sent==50+3+51);
+ p.panel_lock=0;clock_depth=0;
+ puts("PASS: FAULT recovery through restore, unknown-backlight re-establishment, invalidated level table");
  puts("PASS: real ADFR helpers and coupled HBM run/send/restore/setter: saved ADFR, phase, ready isolation, nested votes, recovery failures");
  puts("ALL M2468 BACKLIGHT HOST TESTS PASSED (hardware, SDE events and time are test doubles)");
  return 0;
